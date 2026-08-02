@@ -1,0 +1,19 @@
+ФАЙЛЫ ДЛЯ GITHUB
+
+Загрузите в корень репозитория всё содержимое этой папки.
+
+НЕ ЗАГРУЖАЙТЕ:
+- файл .env;
+- реальные API-ключи;
+- токен Telegram-бота;
+- базу data/finance.db;
+- выгруженные Excel-файлы.
+
+На сервере секреты задаются через переменные окружения:
+BOT_TOKEN
+ADMIN_IDS
+AI_API_KEY
+AI_BASE_URL=https://api.tokenrouter.com/v1
+AI_MODEL=moonshotai/kimi-k3-free
+DATABASE_PATH=data/finance.db
+TIMEZONE=Europe/Moscow

@@ -1,0 +1,26 @@
+# Секреты
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+
+# Локальные данные бота
+data/*.db
+data/*.db-*
+data/*.sqlite*
+exports/*.xlsx
+exports/*.xls
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
