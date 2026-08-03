@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 from aiogram import F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, FSInputFile, Message, ReplyKeyboardRemove
+from aiogram.types import CallbackQuery, FSInputFile, Message
 
 from app.access import AdminFilter
 from app.config import Settings
@@ -23,11 +23,13 @@ from app.keyboards import (
     SKIP_OBJECT_MENU,
     categories_keyboard,
     confirmation_keyboard,
+    expense_edit_menu_keyboard,
+    expense_selection_keyboard,
     reports_keyboard,
 )
+from app.services.ai import AIService
 from app.services.export_excel import create_excel
-from app.services.kimi import KimiService
-from app.states import AskKimi, ManualTransaction, ObjectReport, SmartInput
+from app.states import AskAI, EditExpense, ManualTransaction, ObjectReport, SmartInput
 
 
 def parse_amount(text: str) -> float:
@@ -61,7 +63,7 @@ def period_bounds(period: str, tz: ZoneInfo) -> tuple[str, datetime | None, date
 def build_router(
     settings: Settings,
     db: Database,
-    kimi: KimiService,
+    ai: AIService,
     export_dir: Path,
 ) -> Router:
     router = Router(name="finance")
@@ -102,6 +104,25 @@ def build_router(
         else:
             await message_or_callback.answer(text, reply_markup=MAIN_MENU)
 
+    async def send_edit_expense_preview(
+        target: Message | CallbackQuery,
+        state: FSMContext,
+        *,
+        edit_existing: bool = False,
+    ) -> None:
+        data = await state.get_data()
+        tx_id = data.get("edit_tx_id")
+        text = f"<b>Редактирование расхода #{tx_id}</b>\n\n{transaction_preview(data)}\n\nЧто изменить?"
+        if isinstance(target, CallbackQuery):
+            if target.message:
+                if edit_existing:
+                    await target.message.edit_text(text, reply_markup=expense_edit_menu_keyboard())
+                else:
+                    await target.message.answer(text, reply_markup=expense_edit_menu_keyboard())
+            await target.answer()
+        else:
+            await target.answer(text, reply_markup=expense_edit_menu_keyboard())
+
     @router.message(Command("myid"))
     async def my_id(message: Message) -> None:
         await message.answer(f"Ваш Telegram ID: <code>{message.from_user.id}</code>")
@@ -109,11 +130,11 @@ def build_router(
     @router.message(admin, CommandStart())
     async def start(message: Message, state: FSMContext) -> None:
         await state.clear()
-        ai_status = "подключён" if kimi.enabled else "не подключён"
+        ai_status = "подключён" if ai.enabled else "не подключён"
         await message.answer(
             "<b>ФД Финансы</b>\n\n"
             "Учёт доходов, расходов и прибыли по объектам.\n"
-            f"Kimi: <b>{ai_status}</b>.",
+            f"Groq: <b>{ai_status}</b>.",
             reply_markup=MAIN_MENU,
         )
 
@@ -123,7 +144,7 @@ def build_router(
         await state.clear()
         await message.answer("Действие отменено.", reply_markup=MAIN_MENU)
 
-    @router.callback_query(admin, F.data.in_({"transaction:cancel", "smart:cancel"}))
+    @router.callback_query(admin, F.data.in_({"transaction:cancel", "smart:cancel", "edit_expense:cancel"}))
     async def cancel_callback(callback: CallbackQuery, state: FSMContext) -> None:
         await state.clear()
         if callback.message:
@@ -213,6 +234,166 @@ def build_router(
             await callback.message.answer("Введите операцию заново. Начните с суммы:", reply_markup=CANCEL_MENU)
         await callback.answer()
 
+    # -------------------- Редактирование расходов --------------------
+
+    @router.message(admin, F.text == "✏️ Изменить расход")
+    @router.message(admin, Command("edit_expense"))
+    async def edit_expense_start(message: Message, state: FSMContext) -> None:
+        await state.clear()
+        rows = await db.recent_expenses(12)
+        if not rows:
+            await message.answer("Расходов пока нет.", reply_markup=MAIN_MENU)
+            return
+        await message.answer(
+            "Выберите расход, который нужно изменить. Показаны последние 12 расходов:",
+            reply_markup=expense_selection_keyboard(rows),
+        )
+
+    @router.callback_query(admin, F.data.startswith("edit_expense:select:"))
+    async def edit_expense_select(callback: CallbackQuery, state: FSMContext) -> None:
+        try:
+            tx_id = int((callback.data or "").rsplit(":", maxsplit=1)[1])
+        except (ValueError, IndexError):
+            await callback.answer("Неверный номер операции", show_alert=True)
+            return
+        row = await db.get_transaction(tx_id)
+        if not row or row.get("tx_type") != "expense":
+            await callback.answer("Расход не найден или уже удалён", show_alert=True)
+            return
+        await state.clear()
+        await state.set_state(EditExpense.menu)
+        await state.update_data(
+            edit_tx_id=tx_id,
+            tx_type="expense",
+            amount=float(row["amount"]),
+            category=row["category"],
+            object_name=row.get("object_name"),
+            comment=row.get("comment"),
+        )
+        await send_edit_expense_preview(callback, state, edit_existing=True)
+
+    @router.callback_query(admin, F.data == "edit_expense:menu")
+    async def edit_expense_back_to_menu(callback: CallbackQuery, state: FSMContext) -> None:
+        data = await state.get_data()
+        if not data.get("edit_tx_id"):
+            await state.clear()
+            await callback.answer("Редактирование уже завершено", show_alert=True)
+            return
+        await state.set_state(EditExpense.menu)
+        await send_edit_expense_preview(callback, state, edit_existing=True)
+
+    @router.callback_query(EditExpense.menu, admin, F.data == "edit_expense:field:amount")
+    async def edit_expense_amount_start(callback: CallbackQuery, state: FSMContext) -> None:
+        await state.set_state(EditExpense.amount)
+        if callback.message:
+            await callback.message.edit_reply_markup(reply_markup=None)
+            await callback.message.answer("Введите новую сумму расхода:", reply_markup=CANCEL_MENU)
+        await callback.answer()
+
+    @router.message(EditExpense.amount, admin)
+    async def edit_expense_amount(message: Message, state: FSMContext) -> None:
+        try:
+            amount = parse_amount(message.text or "")
+        except ValueError as error:
+            await message.answer(str(error))
+            return
+        await state.update_data(amount=amount)
+        await state.set_state(EditExpense.menu)
+        await send_edit_expense_preview(message, state)
+
+    @router.callback_query(EditExpense.menu, admin, F.data == "edit_expense:field:category")
+    async def edit_expense_category_start(callback: CallbackQuery, state: FSMContext) -> None:
+        await state.set_state(EditExpense.category)
+        if callback.message:
+            await callback.message.edit_reply_markup(reply_markup=None)
+            await callback.message.answer(
+                "Выберите новую категорию расхода:",
+                reply_markup=categories_keyboard("expense", prefix="edit_category"),
+            )
+        await callback.answer()
+
+    @router.callback_query(EditExpense.category, admin, F.data.startswith("edit_category:expense:"))
+    async def edit_expense_category(callback: CallbackQuery, state: FSMContext) -> None:
+        try:
+            raw_index = (callback.data or "").rsplit(":", maxsplit=1)[1]
+            category = ALL_CATEGORIES["expense"][int(raw_index)]
+        except (ValueError, IndexError):
+            await callback.answer("Категория не найдена", show_alert=True)
+            return
+        await state.update_data(category=category)
+        await state.set_state(EditExpense.menu)
+        if callback.message:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        await send_edit_expense_preview(callback, state)
+
+    @router.callback_query(EditExpense.menu, admin, F.data == "edit_expense:field:object")
+    async def edit_expense_object_start(callback: CallbackQuery, state: FSMContext) -> None:
+        await state.set_state(EditExpense.object_name)
+        if callback.message:
+            await callback.message.edit_reply_markup(reply_markup=None)
+            await callback.message.answer(
+                "Введите новое название объекта или выберите «Без объекта»:",
+                reply_markup=SKIP_OBJECT_MENU,
+            )
+        await callback.answer()
+
+    @router.message(EditExpense.object_name, admin)
+    async def edit_expense_object(message: Message, state: FSMContext) -> None:
+        text = (message.text or "").strip()
+        object_name = None if text.casefold() == "без объекта" else text[:120]
+        await state.update_data(object_name=object_name)
+        await state.set_state(EditExpense.menu)
+        await send_edit_expense_preview(message, state)
+
+    @router.callback_query(EditExpense.menu, admin, F.data == "edit_expense:field:comment")
+    async def edit_expense_comment_start(callback: CallbackQuery, state: FSMContext) -> None:
+        await state.set_state(EditExpense.comment)
+        if callback.message:
+            await callback.message.edit_reply_markup(reply_markup=None)
+            await callback.message.answer(
+                "Введите новый комментарий или выберите «Без комментария»:",
+                reply_markup=SKIP_COMMENT_MENU,
+            )
+        await callback.answer()
+
+    @router.message(EditExpense.comment, admin)
+    async def edit_expense_comment(message: Message, state: FSMContext) -> None:
+        text = (message.text or "").strip()
+        comment = None if text.casefold() == "без комментария" else text[:250]
+        await state.update_data(comment=comment)
+        await state.set_state(EditExpense.menu)
+        await send_edit_expense_preview(message, state)
+
+    @router.callback_query(EditExpense.menu, admin, F.data == "edit_expense:save")
+    async def edit_expense_save(callback: CallbackQuery, state: FSMContext) -> None:
+        data = await state.get_data()
+        tx_id = int(data.get("edit_tx_id", 0))
+        if not tx_id:
+            await callback.answer("Операция не выбрана", show_alert=True)
+            return
+        updated = await db.update_expense(
+            tx_id=tx_id,
+            amount=float(data["amount"]),
+            category=str(data["category"]),
+            object_name=data.get("object_name"),
+            comment=data.get("comment"),
+            updated_at=datetime.now(tz).replace(tzinfo=None),
+            updated_by=callback.from_user.id,
+        )
+        if not updated:
+            await callback.answer("Не удалось изменить расход", show_alert=True)
+            return
+        await state.clear()
+        if callback.message:
+            await callback.message.edit_reply_markup(reply_markup=None)
+            await callback.message.answer(
+                f"✅ Расход #{tx_id} изменён.\n\n{transaction_preview(data)}",
+                reply_markup=MAIN_MENU,
+            )
+        await callback.answer("Изменения сохранены")
+
+    # -------------------- Отчёты и выгрузка --------------------
+
     @router.message(admin, F.text == "📊 Отчёты")
     async def reports(message: Message) -> None:
         await message.answer("Выберите период:", reply_markup=reports_keyboard())
@@ -271,11 +452,13 @@ def build_router(
         finally:
             path.unlink(missing_ok=True)
 
+    # -------------------- Groq --------------------
+
     @router.message(admin, F.text == "🧠 Умный ввод")
     async def smart_start(message: Message, state: FSMContext) -> None:
         await state.clear()
         await state.set_state(SmartInput.text)
-        status = "Kimi распознает сообщение." if kimi.enabled else "Kimi не подключён — будет использован простой распознаватель."
+        status = "Groq распознает сообщение." if ai.enabled else "Groq не подключён — будет использован простой распознаватель."
         await message.answer(
             "Опишите одну операцию обычным текстом.\n\n"
             "Например: <i>Купил металл за 38 500 рублей для навеса в Репном.</i>\n\n"
@@ -286,7 +469,7 @@ def build_router(
     @router.message(SmartInput.text, admin)
     async def smart_parse(message: Message, state: FSMContext) -> None:
         try:
-            parsed = await kimi.parse_operation(message.text or "")
+            parsed = await ai.parse_operation(message.text or "")
         except ValueError as error:
             await message.answer(f"Не удалось распознать операцию: {escape(str(error))}")
             return
@@ -300,7 +483,7 @@ def build_router(
 
     @router.callback_query(SmartInput.confirm, admin, F.data == "smart:confirm")
     async def smart_confirm(callback: CallbackQuery, state: FSMContext) -> None:
-        await save_operation(callback, state, "kimi" if kimi.enabled else "fallback")
+        await save_operation(callback, state, "groq" if ai.enabled else "fallback")
 
     @router.callback_query(SmartInput.confirm, admin, F.data == "smart:edit")
     async def smart_edit(callback: CallbackQuery, state: FSMContext) -> None:
@@ -311,10 +494,10 @@ def build_router(
             await callback.message.answer("Опишите операцию заново одним сообщением:", reply_markup=CANCEL_MENU)
         await callback.answer()
 
-    @router.message(admin, F.text == "🤖 Спросить Kimi")
-    async def ask_kimi_start(message: Message, state: FSMContext) -> None:
+    @router.message(admin, F.text == "🤖 Спросить Groq")
+    async def ask_ai_start(message: Message, state: FSMContext) -> None:
         await state.clear()
-        await state.set_state(AskKimi.question)
+        await state.set_state(AskAI.question)
         await message.answer(
             "Задайте вопрос о финансах. Например:\n"
             "• На что ушло больше всего денег?\n"
@@ -323,8 +506,8 @@ def build_router(
             reply_markup=CANCEL_MENU,
         )
 
-    @router.message(AskKimi.question, admin)
-    async def ask_kimi(message: Message, state: FSMContext) -> None:
+    @router.message(AskAI.question, admin)
+    async def ask_ai(message: Message, state: FSMContext) -> None:
         question = (message.text or "").strip()
         total = await db.summary()
         categories = await db.category_totals()
@@ -356,9 +539,9 @@ def build_router(
                 f"комментарий: {row.get('comment') or '-'}"
             )
         try:
-            answer = await kimi.answer_finance_question(question, "\n".join(context_lines))
+            answer = await ai.answer_finance_question(question, "\n".join(context_lines))
         except Exception as error:
-            answer = f"Ошибка обращения к Kimi: {error}"
+            answer = f"Ошибка обращения к Groq: {error}"
         await state.clear()
         for start_index in range(0, len(answer), 3900):
             await message.answer(escape(answer[start_index:start_index + 3900]), reply_markup=MAIN_MENU)

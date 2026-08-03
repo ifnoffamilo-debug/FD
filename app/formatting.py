@@ -41,9 +41,10 @@ def transactions_text(rows: list[dict[str, Any]], title: str = "Последни
     for row in rows:
         icon = "🟢" if row["tx_type"] == "income" else "🔴"
         object_part = f" · {escape(row['object_name'])}" if row.get("object_name") else ""
+        changed = " · ✏️ изменено" if row.get('updated_at') else ""
         lines.append(
             f"{icon} #{row['id']} <b>{money(float(row['amount']))}</b> · "
-            f"{escape(row['category'])}{object_part}\n"
+            f"{escape(row['category'])}{object_part}{changed}\n"
             f"<code>{row['created_at']}</code>"
         )
     return "\n\n".join(lines)

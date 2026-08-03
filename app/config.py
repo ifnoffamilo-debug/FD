@@ -52,8 +52,8 @@ def load_settings() -> Settings:
         bot_token=token,
         admin_ids=admin_ids,
         ai_api_key=ai_key,
-        ai_base_url=os.getenv("AI_BASE_URL", "https://api.tokenrouter.com/v1").strip().rstrip("/") or "https://api.tokenrouter.com/v1",
-        ai_model=os.getenv("AI_MODEL", "moonshotai/kimi-k3-free").strip() or "moonshotai/kimi-k3-free",
+        ai_base_url=os.getenv("AI_BASE_URL", "https://api.groq.com/openai/v1").strip().rstrip("/") or "https://api.groq.com/openai/v1",
+        ai_model=os.getenv("AI_MODEL", "llama-3.3-70b-versatile").strip() or "llama-3.3-70b-versatile",
         database_path=db_path,
         timezone=os.getenv("TIMEZONE", "Europe/Moscow").strip() or "Europe/Moscow",
     )

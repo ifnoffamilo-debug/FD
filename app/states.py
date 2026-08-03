@@ -14,9 +14,17 @@ class SmartInput(StatesGroup):
     confirm = State()
 
 
-class AskKimi(StatesGroup):
+class AskAI(StatesGroup):
     question = State()
 
 
 class ObjectReport(StatesGroup):
     object_name = State()
+
+
+class EditExpense(StatesGroup):
+    menu = State()
+    amount = State()
+    category = State()
+    object_name = State()
+    comment = State()

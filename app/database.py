@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
@@ -52,6 +53,8 @@ class Database:
                         created_at TEXT NOT NULL,
                         created_by INTEGER NOT NULL,
                         source TEXT NOT NULL DEFAULT 'manual',
+                        updated_at TEXT,
+                        updated_by INTEGER,
                         deleted_at TEXT
                     );
 
@@ -70,6 +73,16 @@ class Database:
                     );
                     """
                 )
+
+                # Миграция старой базы: CREATE TABLE IF NOT EXISTS не добавляет новые колонки.
+                columns = {
+                    str(row["name"])
+                    for row in db.execute("PRAGMA table_info(transactions)").fetchall()
+                }
+                if "updated_at" not in columns:
+                    db.execute("ALTER TABLE transactions ADD COLUMN updated_at TEXT")
+                if "updated_by" not in columns:
+                    db.execute("ALTER TABLE transactions ADD COLUMN updated_by INTEGER")
 
         await self._run(operation)
 
@@ -106,6 +119,105 @@ class Database:
                     (created_by, tx_id, f"{tx_type}:{amount}:{category}", timestamp),
                 )
                 return tx_id
+
+        return await self._run(operation)
+
+    async def get_transaction(self, tx_id: int) -> dict[str, Any] | None:
+        def operation() -> dict[str, Any] | None:
+            with self._connect() as db:
+                row = db.execute(
+                    """
+                    SELECT id, tx_type, amount, category, object_name, comment,
+                           created_at, created_by, source, updated_at, updated_by
+                    FROM transactions
+                    WHERE id = ? AND deleted_at IS NULL
+                    """,
+                    (tx_id,),
+                ).fetchone()
+                return dict(row) if row else None
+
+        return await self._run(operation)
+
+    async def recent_expenses(self, limit: int = 12) -> list[dict[str, Any]]:
+        def operation() -> list[dict[str, Any]]:
+            with self._connect() as db:
+                return [
+                    dict(item)
+                    for item in db.execute(
+                        """
+                        SELECT id, tx_type, amount, category, object_name, comment,
+                               created_at, source, updated_at
+                        FROM transactions
+                        WHERE deleted_at IS NULL AND tx_type = 'expense'
+                        ORDER BY created_at DESC, id DESC
+                        LIMIT ?
+                        """,
+                        (limit,),
+                    ).fetchall()
+                ]
+
+        return await self._run(operation)
+
+    async def update_expense(
+        self,
+        *,
+        tx_id: int,
+        amount: float,
+        category: str,
+        object_name: str | None,
+        comment: str | None,
+        updated_at: datetime,
+        updated_by: int,
+    ) -> bool:
+        timestamp = updated_at.strftime("%Y-%m-%d %H:%M:%S")
+
+        def operation() -> bool:
+            with self._connect() as db:
+                old_row = db.execute(
+                    """
+                    SELECT id, tx_type, amount, category, object_name, comment
+                    FROM transactions
+                    WHERE id = ? AND deleted_at IS NULL AND tx_type = 'expense'
+                    """,
+                    (tx_id,),
+                ).fetchone()
+                if not old_row:
+                    return False
+
+                old_data = dict(old_row)
+                new_data = {
+                    "id": tx_id,
+                    "tx_type": "expense",
+                    "amount": amount,
+                    "category": category,
+                    "object_name": object_name,
+                    "comment": comment,
+                }
+                cursor = db.execute(
+                    """
+                    UPDATE transactions
+                    SET amount = ?, category = ?, object_name = ?, comment = ?,
+                        updated_at = ?, updated_by = ?
+                    WHERE id = ? AND deleted_at IS NULL AND tx_type = 'expense'
+                    """,
+                    (amount, category, object_name, comment, timestamp, updated_by, tx_id),
+                )
+                if cursor.rowcount != 1:
+                    return False
+
+                details = json.dumps(
+                    {"before": old_data, "after": new_data},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                db.execute(
+                    """
+                    INSERT INTO audit_log (user_id, action, entity_id, details, created_at)
+                    VALUES (?, 'update_expense', ?, ?, ?)
+                    """,
+                    (updated_by, tx_id, details, timestamp),
+                )
+                return True
 
         return await self._run(operation)
 
@@ -192,7 +304,8 @@ class Database:
                     dict(item)
                     for item in db.execute(
                         """
-                        SELECT id, tx_type, amount, category, object_name, comment, created_at, source
+                        SELECT id, tx_type, amount, category, object_name, comment,
+                               created_at, source, updated_at
                         FROM transactions
                         WHERE deleted_at IS NULL
                         ORDER BY created_at DESC, id DESC
@@ -212,7 +325,7 @@ class Database:
                     for item in db.execute(
                         """
                         SELECT id, tx_type, amount, category, object_name, comment,
-                               created_at, created_by, source
+                               created_at, created_by, source, updated_at, updated_by
                         FROM transactions
                         WHERE deleted_at IS NULL
                         ORDER BY created_at DESC, id DESC

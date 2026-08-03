@@ -15,9 +15,11 @@ HEADERS = [
     "Категория",
     "Объект",
     "Комментарий",
-    "Дата",
-    "Telegram ID",
+    "Дата создания",
+    "Создал Telegram ID",
     "Источник",
+    "Дата изменения",
+    "Изменил Telegram ID",
 ]
 
 
@@ -46,12 +48,14 @@ async def create_excel(rows: list[dict], export_dir: Path) -> Path:
                 row["created_at"],
                 row["created_by"],
                 row["source"],
+                row.get("updated_at") or "",
+                row.get("updated_by") or "",
             ]
         )
 
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = ws.dimensions
-    widths = [8, 12, 14, 24, 28, 42, 20, 18, 14]
+    widths = [8, 12, 14, 24, 28, 42, 20, 20, 14, 20, 20]
     for index, width in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(index)].width = width
     for cell in ws["C"][1:]:
