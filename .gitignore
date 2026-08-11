@@ -1,26 +1,12 @@
-# Секреты
 .env
-.env.*
-!.env.example
-
-# Python
 .venv/
 venv/
 __pycache__/
-*.py[cod]
-*$py.class
-.pytest_cache/
-.mypy_cache/
-
-# Локальные данные бота
-data/*.db
-data/*.db-*
-data/*.sqlite*
+*.pyc
+*.pyo
+*.db
+*.db-shm
+*.db-wal
 exports/*.xlsx
-exports/*.xls
-
-# IDE / OS
-.vscode/
-.idea/
-.DS_Store
-Thumbs.db
+data/finance.db*
+data/receipts/

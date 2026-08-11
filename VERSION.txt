@@ -1,2 +1,1 @@
-ФД Финансы v1.1 TokenRouter
-Модель по умолчанию: moonshotai/kimi-k3-free
+2.0.0
