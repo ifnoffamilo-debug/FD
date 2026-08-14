@@ -26,7 +26,7 @@ async def main() -> None:
         BotCommand(command="myid",description="Показать Telegram ID"),
         BotCommand(command="edit_expense",description="Изменить расход"),
     ])
-    logging.info("ФД Финансы v2.0 запущен. Groq: %s","ON" if ai.enabled else "OFF")
+    logging.info("ФД Финансы v2.1 запущен. Groq: %s","ON" if ai.enabled else "OFF")
     await dp.start_polling(bot,allowed_updates=dp.resolve_used_update_types())
 
 

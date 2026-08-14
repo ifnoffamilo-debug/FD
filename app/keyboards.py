@@ -5,7 +5,7 @@ from typing import Any
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from app.constants import CATEGORIES, VEHICLE_EXPENSE_TYPES
+from app.constants import CATEGORIES, VEHICLE_EXPENSE_TYPES, FUEL_TYPES
 from app.formatting import money
 
 
@@ -26,7 +26,8 @@ def main_menu(scope: str) -> ReplyKeyboardMarkup:
     if scope == "work":
         rows.append([KeyboardButton(text="📁 Объекты"), KeyboardButton(text="🧠 Умный ввод")])
     else:
-        rows.append([KeyboardButton(text="🚗 Автомобиль"), KeyboardButton(text="🧠 Умный ввод")])
+        rows.append([KeyboardButton(text="🚗 Автомобиль"), KeyboardButton(text="💸 Долги")])
+        rows.append([KeyboardButton(text="🧠 Умный ввод")])
     rows.extend([
         [KeyboardButton(text="🤖 Спросить Groq"), KeyboardButton(text="📤 Excel")],
         [KeyboardButton(text="🔄 Сменить раздел")],
@@ -143,6 +144,82 @@ def vehicle_expense_type_keyboard(vehicle_id: int) -> InlineKeyboardMarkup:
         if t!="Топливо": b.button(text=t,callback_data=f"auto:type:{vehicle_id}:{i}")
     b.adjust(2);b.row(InlineKeyboardButton(text="❌ Отмена",callback_data="flow:cancel"));return b.as_markup()
 
+
+
+def fuel_type_keyboard(vehicle_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⛽ Бензин", callback_data=f"auto:fueltype:{vehicle_id}:petrol"),
+         InlineKeyboardButton(text="🔵 Газ", callback_data=f"auto:fueltype:{vehicle_id}:gas")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="flow:cancel")],
+    ])
+
+
+def debts_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить долг", callback_data="debt:add")],
+        [InlineKeyboardButton(text="👤 Мне должны", callback_data="debt:list:to_me"),
+         InlineKeyboardButton(text="💳 Я должен", callback_data="debt:list:i_owe")],
+        [InlineKeyboardButton(text="📋 Все активные", callback_data="debt:list:active"),
+         InlineKeyboardButton(text="✅ Закрытые", callback_data="debt:list:closed")],
+    ])
+
+
+def debt_direction_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👤 Мне должны", callback_data="debt:newdir:to_me")],
+        [InlineKeyboardButton(text="💳 Я должен", callback_data="debt:newdir:i_owe")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="flow:cancel")],
+    ])
+
+
+def debt_list_keyboard(rows: list[dict[str,Any]]) -> InlineKeyboardMarkup:
+    b=InlineKeyboardBuilder()
+    for r in rows[:40]:
+        who=str(r.get("person") or "Без имени")
+        if len(who)>22: who=who[:19]+"…"
+        rem=float(r.get("remaining") or 0)
+        icon="👤" if r.get("direction")=="to_me" else "💳"
+        b.button(text=f"{icon} {who} · {money(rem)}", callback_data=f"debt:view:{r['id']}")
+    b.adjust(1)
+    b.row(InlineKeyboardButton(text="⬅️ К долгам",callback_data="debt:menu"))
+    return b.as_markup()
+
+
+def debt_card_keyboard(debt_id: int, closed: bool=False) -> InlineKeyboardMarkup:
+    rows=[]
+    if not closed:
+        rows.append([InlineKeyboardButton(text="💰 Частично погасить",callback_data=f"debt:pay:{debt_id}"),
+                     InlineKeyboardButton(text="✅ Закрыть долг",callback_data=f"debt:close:{debt_id}")])
+        rows.append([InlineKeyboardButton(text="✏️ Изменить",callback_data=f"debt:edit:{debt_id}"),
+                     InlineKeyboardButton(text="📖 История",callback_data=f"debt:history:{debt_id}")])
+    else:
+        rows.append([InlineKeyboardButton(text="📖 История",callback_data=f"debt:history:{debt_id}")])
+    rows.append([InlineKeyboardButton(text="⬅️ К долгам",callback_data="debt:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def debt_edit_keyboard(debt_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👤 Кто",callback_data=f"debt:editfield:{debt_id}:person"),
+         InlineKeyboardButton(text="💰 Сумма",callback_data=f"debt:editfield:{debt_id}:amount")],
+        [InlineKeyboardButton(text="📅 Срок",callback_data=f"debt:editfield:{debt_id}:due"),
+         InlineKeyboardButton(text="📝 Комментарий",callback_data=f"debt:editfield:{debt_id}:comment")],
+        [InlineKeyboardButton(text="⬅️ К долгу",callback_data=f"debt:view:{debt_id}")],
+    ])
+
+
+def debt_close_confirm_keyboard(debt_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, закрыть",callback_data=f"debt:closeconfirm:{debt_id}")],
+        [InlineKeyboardButton(text="❌ Нет",callback_data=f"debt:view:{debt_id}")],
+    ])
+
+
+def debt_payment_record_keyboard(payment_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, записать",callback_data=f"debt:record:{payment_id}:yes")],
+        [InlineKeyboardButton(text="Нет, только долг",callback_data=f"debt:record:{payment_id}:no")],
+    ])
 
 def vehicle_stats_keyboard(vehicle_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[

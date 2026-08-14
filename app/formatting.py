@@ -27,6 +27,12 @@ def transaction_preview(data: dict[str, Any]) -> str:
         lines.append(f"Авто: {escape(str(data['vehicle_name']))}")
     if data.get("vehicle_expense_type"):
         lines.append(f"Тип авторасхода: {escape(str(data['vehicle_expense_type']))}")
+    if data.get("fuel_type"):
+        lines.append(f"Топливо: {escape(str(data['fuel_type']))}")
+    if data.get("fuel_liters"):
+        lines.append(f"Литры: {float(data['fuel_liters']):.1f} л")
+    if data.get("odometer"):
+        lines.append(f"Пробег: {float(data['odometer']):,.0f} км")
     lines.append(f"Комментарий: {escape(str(data.get('comment') or 'Без комментария'))}")
     return "\n".join(lines)
 
@@ -50,6 +56,8 @@ def transactions_text(rows: list[dict[str, Any]], title: str = "Последни
         icon = "🟢" if row["tx_type"] == "income" else "🔴"
         obj = f" · {escape(str(row['object_name']))}" if row.get("object_name") else ""
         car = f" · 🚗 {escape(str(row['vehicle_expense_type']))}" if row.get("vehicle_expense_type") else ""
+        if row.get("fuel_type"):
+            car += f" ({escape(str(row['fuel_type']))})"
         receipt = " · 📷" if row.get("receipt_file_id") else ""
         changed = " · ✏️" if row.get("updated_at") else ""
         lines.append(

@@ -13,7 +13,7 @@ from aiogram.types import CallbackQuery, FSInputFile, Message
 
 from app.access import AdminFilter
 from app.config import Settings
-from app.constants import CATEGORIES, SCOPES, TYPE_LABELS, VEHICLE_EXPENSE_TYPES
+from app.constants import CATEGORIES, SCOPES, TYPE_LABELS, VEHICLE_EXPENSE_TYPES, DEBT_DIRECTIONS
 from app.database import Database, Summary
 from app.formatting import money, summary_text, transaction_preview, transactions_text
 from app.keyboards import (
@@ -21,13 +21,15 @@ from app.keyboards import (
     expense_edit_keyboard, expense_selection_keyboard, main_menu, object_card_keyboard,
     object_choice_keyboard, objects_menu, receipt_keyboard, reports_keyboard, scope_menu,
     service_keyboard, vehicle_card_keyboard, vehicle_expense_type_keyboard, vehicle_stats_keyboard,
-    vehicles_keyboard,
+    vehicles_keyboard, fuel_type_keyboard, debts_menu_keyboard, debt_direction_keyboard,
+    debt_list_keyboard, debt_card_keyboard, debt_edit_keyboard, debt_payment_record_keyboard,
+    debt_close_confirm_keyboard,
 )
 from app.services.ai import AIService
 from app.services.export_excel import create_excel
 from app.states import (
     AskAI, AutoExpense, EditExpense, ManualTransaction, MileageFlow, ObjectFlow,
-    ReceiptUpload, ServiceFlow, SmartInput, VehicleFlow,
+    ReceiptUpload, ServiceFlow, SmartInput, VehicleFlow, DebtFlow,
 )
 
 
@@ -47,6 +49,21 @@ def parse_number(text: str, allow_zero: bool = True) -> float:
     value=float(cleaned)
     if value < 0 or (value == 0 and not allow_zero): raise ValueError("Значение должно быть больше нуля")
     return value
+
+
+def parse_debt_date(text: str) -> str | None:
+    raw=(text or "").strip()
+    if raw.casefold() in {"без срока","нет","-","без даты"}: return None
+    for fmt in ("%d.%m.%Y","%d.%m.%y","%Y-%m-%d"):
+        try:return datetime.strptime(raw,fmt).strftime("%Y-%m-%d")
+        except ValueError:pass
+    raise ValueError("Введите дату в формате ДД.ММ.ГГГГ или «Без срока»")
+
+
+def debt_date_text(value: str | None) -> str:
+    if not value:return "Без срока"
+    try:return datetime.strptime(value,"%Y-%m-%d").strftime("%d.%m.%Y")
+    except ValueError:return value
 
 
 def month_end(start: datetime) -> datetime:
@@ -120,7 +137,7 @@ def build_router(settings: Settings, db: Database, ai: AIService, export_dir: Pa
             finance_scope=data.get("finance_scope") or await scope_for(user.id),object_id=data.get("object_id"),
             object_name=data.get("object_name"),comment=data.get("comment"),created_at=datetime.now(tz).replace(tzinfo=None),
             created_by=user.id,source=source,vehicle_id=data.get("vehicle_id"),vehicle_expense_type=data.get("vehicle_expense_type"),
-            fuel_liters=data.get("fuel_liters"),odometer=data.get("odometer"),
+            fuel_type=data.get("fuel_type"),fuel_liters=data.get("fuel_liters"),odometer=data.get("odometer"),
         )
         scope=data.get("finance_scope") or await scope_for(user.id)
         preview=transaction_preview(data)
@@ -182,6 +199,61 @@ def build_router(settings: Settings, db: Database, ai: AIService, export_dir: Pa
             if target.message: await target.message.edit_text(text,reply_markup=kb)
             await target.answer()
         else: await target.answer(text,reply_markup=kb)
+
+    async def show_debts_menu(target:Message|CallbackQuery) -> None:
+        totals=await db.debt_totals();active=await db.list_debts(status="active")
+        today=datetime.now(tz).date();overdue=0
+        for d in active:
+            if d.get("due_date"):
+                try:
+                    if datetime.strptime(str(d["due_date"]),"%Y-%m-%d").date()<today:overdue+=1
+                except ValueError:pass
+        net=float(totals["net"]);net_icon="🟢" if net>=0 else "🔴"
+        text=(f"💸 <b>Долги</b>\n\nМне должны: <b>{money(float(totals['to_me']))}</b>\n"
+              f"Я должен: <b>{money(float(totals['i_owe']))}</b>\n"
+              f"{net_icon} Чистая позиция: <b>{money(net)}</b>\n"
+              f"Активных долгов: {len(active)}")
+        if overdue:text+=f"\n⚠️ Просрочено: <b>{overdue}</b>"
+        if isinstance(target,CallbackQuery):
+            if target.message: await target.message.edit_text(text,reply_markup=debts_menu_keyboard())
+            await target.answer()
+        else: await target.answer(text,reply_markup=debts_menu_keyboard())
+
+    async def show_debt_card(target:Message|CallbackQuery,debt_id:int) -> None:
+        d=await db.get_debt(debt_id)
+        if not d:
+            if isinstance(target,CallbackQuery):await target.answer("Долг не найден",show_alert=True)
+            return
+        direction=DEBT_DIRECTIONS.get(str(d["direction"]),str(d["direction"]))
+        remaining=float(d["remaining"]);paid=float(d["paid_amount"]);original=float(d["original_amount"])
+        status="✅ Закрыт" if d["status"]=="closed" else "🟡 Активен"
+        due=debt_date_text(d.get("due_date"));overdue=False
+        if d.get("due_date") and d["status"]=="active":
+            try:overdue=datetime.strptime(str(d["due_date"]),"%Y-%m-%d").date()<datetime.now(tz).date()
+            except ValueError:pass
+        text=(f"💸 <b>{escape(direction)}</b>\n"
+              f"Кто: <b>{escape(str(d['person']))}</b>\n"
+              f"Сумма долга: <b>{money(original)}</b>\n"
+              f"Погашено: <b>{money(paid)}</b>\n"
+              f"Осталось: <b>{money(remaining)}</b>\n"
+              f"Срок: <b>{escape(due)}</b>{' ⚠️' if overdue else ''}\n"
+              f"Статус: {status}\n"
+              f"Комментарий: {escape(str(d.get('comment') or 'Без комментария'))}")
+        kb=debt_card_keyboard(debt_id,d["status"]=="closed")
+        if isinstance(target,CallbackQuery):
+            if target.message: await target.message.edit_text(text,reply_markup=kb)
+            await target.answer()
+        else: await target.answer(text,reply_markup=kb)
+
+    async def prompt_debt_payment_record(target:Message|CallbackQuery,payment_id:int) -> None:
+        pmt=await db.get_debt_payment(payment_id)
+        if not pmt:return
+        action="личный доход" if pmt["direction"]=="to_me" else "личный расход"
+        text=(f"✅ Погашение <b>{money(float(pmt['amount']))}</b> записано.\n"
+              f"Добавить эту сумму также как {action}?")
+        msg=target.message if isinstance(target,CallbackQuery) else target
+        if msg:await msg.answer(text,reply_markup=debt_payment_record_keyboard(payment_id))
+        if isinstance(target,CallbackQuery):await target.answer()
 
     # ---------- Base / mode ----------
     @router.message(Command("myid"))
@@ -507,11 +579,19 @@ def build_router(settings: Settings, db: Database, ai: AIService, export_dir: Pa
     async def vehicle_rename(message:Message,state:FSMContext):
         d=await state.get_data();vid=int(d["vehicle_id"]);await db.update_vehicle(vid,name=(message.text or "").strip()[:100]);await state.clear();await show_vehicle_card(message,vid)
 
-    async def auto_amount_begin(callback:CallbackQuery,state:FSMContext,vehicle_id:int,expense_type:str):
-        v=await db.get_vehicle(vehicle_id);await state.clear();await state.set_state(AutoExpense.amount);await state.update_data(vehicle_id=vehicle_id,vehicle_name=v["name"] if v else "Автомобиль",vehicle_expense_type=expense_type,finance_scope="personal",tx_type="expense",category="Автомобиль")
-        await callback.message.answer(f"{expense_type}: введите сумму:",reply_markup=CANCEL_MENU);await callback.answer()
+    async def auto_amount_begin(callback:CallbackQuery,state:FSMContext,vehicle_id:int,expense_type:str,fuel_type:str|None=None):
+        v=await db.get_vehicle(vehicle_id);await state.clear();await state.set_state(AutoExpense.amount);await state.update_data(vehicle_id=vehicle_id,vehicle_name=v["name"] if v else "Автомобиль",vehicle_expense_type=expense_type,fuel_type=fuel_type,finance_scope="personal",tx_type="expense",category="Автомобиль")
+        label=f"{expense_type} — {fuel_type}" if fuel_type else expense_type
+        await callback.message.answer(f"{label}: введите сумму:",reply_markup=CANCEL_MENU);await callback.answer()
     @router.callback_query(admin,F.data.startswith("auto:fuel:"))
-    async def auto_fuel(callback:CallbackQuery,state:FSMContext): await auto_amount_begin(callback,state,int((callback.data or "0").rsplit(":",1)[1]),"Топливо")
+    async def auto_fuel(callback:CallbackQuery,state:FSMContext):
+        vid=int((callback.data or "0").rsplit(":",1)[1]);await state.clear();await state.set_state(AutoExpense.fuel_type);await state.update_data(vehicle_id=vid)
+        if callback.message:await callback.message.answer("Какое топливо заправили?",reply_markup=fuel_type_keyboard(vid))
+        await callback.answer()
+    @router.callback_query(AutoExpense.fuel_type,admin,F.data.startswith("auto:fueltype:"))
+    async def auto_fuel_type(callback:CallbackQuery,state:FSMContext):
+        _,_,vid_s,kind=(callback.data or "").split(":",3);fuel_type="Бензин" if kind=="petrol" else "Газ"
+        await auto_amount_begin(callback,state,int(vid_s),"Топливо",fuel_type)
     @router.callback_query(admin,F.data.startswith("auto:expense:"))
     async def auto_expense_menu(callback:CallbackQuery):
         vid=int((callback.data or "0").rsplit(":",1)[1]);await callback.message.answer("Выберите тип расхода:",reply_markup=vehicle_expense_type_keyboard(vid));await callback.answer()
@@ -542,7 +622,7 @@ def build_router(settings: Settings, db: Database, ai: AIService, export_dir: Pa
     async def auto_confirm(callback:CallbackQuery,state:FSMContext): await save_transaction(callback,state,"auto")
     @router.callback_query(AutoExpense.confirm,admin,F.data=="auto:edit")
     async def auto_redo(callback:CallbackQuery,state:FSMContext):
-        d=await state.get_data();vid=int(d["vehicle_id"]);typ=d["vehicle_expense_type"];await auto_amount_begin(callback,state,vid,typ)
+        d=await state.get_data();vid=int(d["vehicle_id"]);typ=d["vehicle_expense_type"];await auto_amount_begin(callback,state,vid,typ,d.get("fuel_type"))
 
     @router.callback_query(admin,F.data.startswith("auto:mileage:"))
     async def mileage_start(callback:CallbackQuery,state:FSMContext): await state.clear();await state.set_state(MileageFlow.value);await state.update_data(vehicle_id=int((callback.data or "0").rsplit(":",1)[1]));await callback.message.answer("Новый пробег, км:",reply_markup=CANCEL_MENU);await callback.answer()
@@ -562,7 +642,14 @@ def build_router(settings: Settings, db: Database, ai: AIService, export_dir: Pa
         lines=[f"🚗 <b>{escape(str(v['name'] if v else 'Автомобиль'))} — {escape(title)}</b>",f"Всего расходов: <b>{money(total.expense)}</b>"]
         for r in [x for x in cats if x["tx_type"]=="expense"]: lines.append(f"• {escape(str(r['vehicle_expense_type'] or r['category']))}: {money(float(r['total']))}")
         if distance>0: lines.append(f"\nПроехано по зафиксированному пробегу: <b>{distance:,.0f} км</b>\nСтоимость: <b>{total.expense/distance:.2f} ₽/км</b>")
-        if fuel["liters"]>0: lines.append(f"Топливо: {fuel['liters']:.1f} л · средняя цена <b>{fuel['avg_price']:.2f} ₽/л</b>")
+        if fuel["amount"]>0:
+            lines.append(f"\n⛽ Топливо всего: <b>{money(float(fuel['amount']))}</b> · {float(fuel['liters']):.1f} л")
+            for fuel_name in ("Бензин","Газ","Не указано"):
+                fs=fuel.get("by_type",{}).get(fuel_name)
+                if not fs:continue
+                icon="⛽" if fuel_name=="Бензин" else ("🔵" if fuel_name=="Газ" else "▫️")
+                lines.append(f"{icon} {fuel_name}: <b>{money(float(fs['amount']))}</b> · {float(fs['liters']):.1f} л · {float(fs['avg_price']):.2f} ₽/л")
+            if distance>0: lines.append(f"Стоимость топлива: <b>{float(fuel['amount'])/distance:.2f} ₽/км</b>")
         if callback.message: await callback.message.answer("\n".join(lines),reply_markup=vehicle_stats_keyboard(vid))
         await callback.answer()
 
@@ -598,6 +685,189 @@ def build_router(settings: Settings, db: Database, ai: AIService, export_dir: Pa
     @router.message(ServiceFlow.note,admin)
     async def service_note(message:Message,state:FSMContext):
         d=await state.get_data();text=(message.text or "").strip();note=None if text.casefold()=="без комментария" else text[:250];vid=int(d["vehicle_id"]);await db.add_service(vid,d["title"],float(d["last_mileage"]),float(d["interval"]),note,datetime.now(tz).replace(tzinfo=None));await state.clear();await show_vehicle_card(message,vid)
+
+    # ---------- Personal debts ----------
+    @router.message(admin,F.text=="💸 Долги")
+    async def debts_entry(message:Message):
+        if await scope_for(message.from_user.id)!="personal": await message.answer("Долги находятся в личных финансах.");return
+        await show_debts_menu(message)
+
+    @router.callback_query(admin,F.data=="debt:menu")
+    async def debts_menu_cb(callback:CallbackQuery): await show_debts_menu(callback)
+
+    @router.callback_query(admin,F.data.startswith("debt:list:"))
+    async def debts_list(callback:CallbackQuery):
+        mode=(callback.data or "debt:list:active").rsplit(":",1)[1]
+        if mode in {"to_me","i_owe"}: rows=await db.list_debts(status="active",direction=mode);title=DEBT_DIRECTIONS[mode]
+        elif mode=="closed": rows=await db.list_debts(status="closed");title="Закрытые долги"
+        else: rows=await db.list_debts(status="active");title="Все активные долги"
+        text=f"💸 <b>{escape(title)}</b>\n\n"+("Выберите долг:" if rows else "Записей пока нет.")
+        if callback.message: await callback.message.edit_text(text,reply_markup=debt_list_keyboard(rows))
+        await callback.answer()
+
+    @router.callback_query(admin,F.data=="debt:add")
+    async def debt_add_start(callback:CallbackQuery,state:FSMContext):
+        await state.clear();await state.set_state(DebtFlow.direction)
+        if callback.message:await callback.message.answer("Какой это долг?",reply_markup=debt_direction_keyboard())
+        await callback.answer()
+
+    @router.callback_query(DebtFlow.direction,admin,F.data.startswith("debt:newdir:"))
+    async def debt_direction(callback:CallbackQuery,state:FSMContext):
+        direction=(callback.data or "").rsplit(":",1)[1]
+        if direction not in DEBT_DIRECTIONS:await callback.answer("Неизвестный тип долга",show_alert=True);return
+        await state.update_data(debt_direction=direction);await state.set_state(DebtFlow.person)
+        if callback.message:await callback.message.answer("Кто? Введите имя человека или название:",reply_markup=CANCEL_MENU)
+        await callback.answer()
+
+    @router.message(DebtFlow.person,admin)
+    async def debt_person(message:Message,state:FSMContext):
+        person=(message.text or "").strip()[:120]
+        if not person:await message.answer("Введите имя или название.");return
+        await state.update_data(debt_person=person);await state.set_state(DebtFlow.amount);await message.answer("Сумма долга:",reply_markup=CANCEL_MENU)
+
+    @router.message(DebtFlow.amount,admin)
+    async def debt_amount(message:Message,state:FSMContext):
+        try:v=parse_amount(message.text or "")
+        except ValueError as e:await message.answer(str(e));return
+        await state.update_data(debt_amount=v);await state.set_state(DebtFlow.due_date);await message.answer("Срок возврата в формате ДД.ММ.ГГГГ или «Без срока»:",reply_markup=CANCEL_MENU)
+
+    @router.message(DebtFlow.due_date,admin)
+    async def debt_due(message:Message,state:FSMContext):
+        try:due=parse_debt_date(message.text or "")
+        except ValueError as e:await message.answer(str(e));return
+        await state.update_data(debt_due_date=due);await state.set_state(DebtFlow.comment);await message.answer("Комментарий или «Без комментария»:",reply_markup=SKIP_COMMENT_MENU)
+
+    @router.message(DebtFlow.comment,admin)
+    async def debt_comment(message:Message,state:FSMContext):
+        text=(message.text or "").strip();comment=None if text.casefold()=="без комментария" else text[:250]
+        await state.update_data(debt_comment=comment);d=await state.get_data();direction=DEBT_DIRECTIONS[d["debt_direction"]]
+        preview=(f"💸 <b>{escape(direction)}</b>\nКто: <b>{escape(str(d['debt_person']))}</b>\n"
+                 f"Сумма: <b>{money(float(d['debt_amount']))}</b>\nСрок: <b>{escape(debt_date_text(d.get('debt_due_date')))}</b>\n"
+                 f"Комментарий: {escape(str(comment or 'Без комментария'))}")
+        await state.set_state(DebtFlow.confirm);await message.answer("Проверьте:\n\n"+preview,reply_markup=confirmation_keyboard("debtnew"))
+
+    @router.callback_query(DebtFlow.confirm,admin,F.data=="debtnew:confirm")
+    async def debt_confirm(callback:CallbackQuery,state:FSMContext):
+        d=await state.get_data();debt_id=await db.add_debt(d["debt_direction"],d["debt_person"],float(d["debt_amount"]),d.get("debt_due_date"),d.get("debt_comment"),datetime.now(tz).replace(tzinfo=None))
+        await state.clear()
+        if callback.message:await callback.message.answer(f"✅ Долг #{debt_id} сохранён.")
+        await show_debt_card(callback,debt_id)
+
+    @router.callback_query(DebtFlow.confirm,admin,F.data=="debtnew:edit")
+    async def debt_redo(callback:CallbackQuery,state:FSMContext):
+        await state.clear();await state.set_state(DebtFlow.direction)
+        if callback.message:await callback.message.answer("Заполним заново. Какой это долг?",reply_markup=debt_direction_keyboard())
+        await callback.answer()
+
+    @router.callback_query(admin,F.data.startswith("debt:view:"))
+    async def debt_view(callback:CallbackQuery): await show_debt_card(callback,int((callback.data or "0").rsplit(":",1)[1]))
+
+    @router.callback_query(admin,F.data.startswith("debt:pay:"))
+    async def debt_pay_start(callback:CallbackQuery,state:FSMContext):
+        debt_id=int((callback.data or "0").rsplit(":",1)[1]);d=await db.get_debt(debt_id)
+        if not d or d["status"]=="closed":await callback.answer("Долг уже закрыт",show_alert=True);return
+        await state.clear();await state.set_state(DebtFlow.payment);await state.update_data(debt_id=debt_id)
+        if callback.message:await callback.message.answer(f"Остаток: <b>{money(float(d['remaining']))}</b>\nВведите сумму погашения:",reply_markup=CANCEL_MENU)
+        await callback.answer()
+
+    @router.message(DebtFlow.payment,admin)
+    async def debt_payment_amount(message:Message,state:FSMContext):
+        try:amount=parse_amount(message.text or "")
+        except ValueError as e:await message.answer(str(e));return
+        d=await state.get_data();debt_id=int(d["debt_id"]);debt=await db.get_debt(debt_id)
+        if not debt:await state.clear();await message.answer("Долг не найден.");return
+        if amount>float(debt["remaining"])+0.005:await message.answer(f"Сумма больше остатка {money(float(debt['remaining']))}.");return
+        try:payment_id=await db.add_debt_payment(debt_id,amount,datetime.now(tz).replace(tzinfo=None))
+        except ValueError as e:await message.answer(str(e));return
+        await state.clear();await prompt_debt_payment_record(message,payment_id)
+
+    @router.callback_query(admin,F.data.startswith("debt:close:"))
+    async def debt_close(callback:CallbackQuery,state:FSMContext):
+        debt_id=int((callback.data or "0").rsplit(":",1)[1]);d=await db.get_debt(debt_id)
+        if not d:await callback.answer("Долг не найден",show_alert=True);return
+        remaining=float(d["remaining"])
+        if d["status"]=="closed" or remaining<=0.005:await show_debt_card(callback,debt_id);return
+        if callback.message:await callback.message.answer(f"Закрыть долг полностью? Будет записано погашение остатка <b>{money(remaining)}</b>.",reply_markup=debt_close_confirm_keyboard(debt_id))
+        await callback.answer()
+
+    @router.callback_query(admin,F.data.startswith("debt:closeconfirm:"))
+    async def debt_close_confirm(callback:CallbackQuery,state:FSMContext):
+        debt_id=int((callback.data or "0").rsplit(":",1)[1]);d=await db.get_debt(debt_id)
+        if not d:await callback.answer("Долг не найден",show_alert=True);return
+        remaining=float(d["remaining"])
+        if remaining<=0.005:await show_debt_card(callback,debt_id);return
+        payment_id=await db.add_debt_payment(debt_id,remaining,datetime.now(tz).replace(tzinfo=None),"Закрытие долга")
+        await prompt_debt_payment_record(callback,payment_id)
+
+    @router.callback_query(admin,F.data.startswith("debt:record:"))
+    async def debt_record_payment(callback:CallbackQuery):
+        parts=(callback.data or "").split(":");payment_id=int(parts[2]);answer=parts[3]
+        pmt=await db.get_debt_payment(payment_id)
+        if not pmt:await callback.answer("Платёж не найден",show_alert=True);return
+        if answer=="yes" and not pmt.get("transaction_id"):
+            tx_type="income" if pmt["direction"]=="to_me" else "expense";category="Возврат долга" if tx_type=="income" else "Погашение долга"
+            tx_id=await db.add_transaction(tx_type=tx_type,amount=float(pmt["amount"]),category=category,finance_scope="personal",object_id=None,object_name=None,
+                comment=f"Долг: {pmt['person']}",created_at=datetime.now(tz).replace(tzinfo=None),created_by=callback.from_user.id,source="debt")
+            await db.set_debt_payment_transaction(payment_id,tx_id)
+            note=f"✅ Записано в личные финансы как {'доход' if tx_type=='income' else 'расход'} #{tx_id}."
+        elif answer=="yes":note="Эта операция уже записана в личные финансы."
+        else:note="Погашение учтено только во вкладке долгов."
+        if callback.message:await callback.message.answer(note)
+        await show_debt_card(callback,int(pmt["debt_id"]))
+
+    @router.callback_query(admin,F.data.startswith("debt:history:"))
+    async def debt_history(callback:CallbackQuery):
+        debt_id=int((callback.data or "0").rsplit(":",1)[1]);d=await db.get_debt(debt_id);rows=await db.debt_payments(debt_id)
+        if not d:await callback.answer("Долг не найден",show_alert=True);return
+        lines=[f"📖 <b>История — {escape(str(d['person']))}</b>",f"Исходная сумма: <b>{money(float(d['original_amount']))}</b>"]
+        if not rows:lines.append("\nПогашений пока нет.")
+        for r in rows:
+            linked=f" · операция #{r['transaction_id']}" if r.get("transaction_id") else ""
+            lines.append(f"\n• <b>{money(float(r['amount']))}</b> · <code>{r['paid_at']}</code>{linked}")
+        if callback.message:await callback.message.answer("\n".join(lines),reply_markup=debt_card_keyboard(debt_id,d["status"]=="closed"))
+        await callback.answer()
+
+    @router.callback_query(admin,F.data.startswith("debt:edit:"))
+    async def debt_edit(callback:CallbackQuery):
+        debt_id=int((callback.data or "0").rsplit(":",1)[1]);d=await db.get_debt(debt_id)
+        if not d or d["status"]=="closed":await callback.answer("Закрытый долг нельзя изменить",show_alert=True);return
+        if callback.message:await callback.message.answer("Что изменить?",reply_markup=debt_edit_keyboard(debt_id))
+        await callback.answer()
+
+    @router.callback_query(admin,F.data.startswith("debt:editfield:"))
+    async def debt_edit_field(callback:CallbackQuery,state:FSMContext):
+        _,_,debt_id_s,field=(callback.data or "").split(":",3);debt_id=int(debt_id_s);await state.clear();await state.update_data(debt_id=debt_id)
+        prompts={"person":("Кто? Новое имя или название:",DebtFlow.edit_person,CANCEL_MENU),"amount":("Новая исходная сумма долга:",DebtFlow.edit_amount,CANCEL_MENU),"due":("Новый срок ДД.ММ.ГГГГ или «Без срока»:",DebtFlow.edit_due_date,CANCEL_MENU),"comment":("Новый комментарий или «Без комментария»:",DebtFlow.edit_comment,SKIP_COMMENT_MENU)}
+        if field not in prompts:await callback.answer("Поле не найдено",show_alert=True);return
+        prompt,st,kb=prompts[field];await state.set_state(st)
+        if callback.message:await callback.message.answer(prompt,reply_markup=kb)
+        await callback.answer()
+
+    @router.message(DebtFlow.edit_person,admin)
+    async def debt_edit_person(message:Message,state:FSMContext):
+        person=(message.text or "").strip()[:120]
+        if not person:await message.answer("Введите имя.");return
+        d=await state.get_data();debt_id=int(d["debt_id"]);await db.update_debt(debt_id,person=person);await state.clear();await show_debt_card(message,debt_id)
+
+    @router.message(DebtFlow.edit_amount,admin)
+    async def debt_edit_amount(message:Message,state:FSMContext):
+        try:amount=parse_amount(message.text or "")
+        except ValueError as e:await message.answer(str(e));return
+        d=await state.get_data();debt_id=int(d["debt_id"])
+        try:await db.update_debt(debt_id,original_amount=amount)
+        except ValueError as e:await message.answer(str(e));return
+        await state.clear();await show_debt_card(message,debt_id)
+
+    @router.message(DebtFlow.edit_due_date,admin)
+    async def debt_edit_due(message:Message,state:FSMContext):
+        try:due=parse_debt_date(message.text or "")
+        except ValueError as e:await message.answer(str(e));return
+        d=await state.get_data();debt_id=int(d["debt_id"]);await db.update_debt(debt_id,due_date=due);await state.clear();await show_debt_card(message,debt_id)
+
+    @router.message(DebtFlow.edit_comment,admin)
+    async def debt_edit_comment(message:Message,state:FSMContext):
+        text=(message.text or "").strip();comment=None if text.casefold()=="без комментария" else text[:250]
+        d=await state.get_data();debt_id=int(d["debt_id"]);await db.update_debt(debt_id,comment=comment);await state.clear();await show_debt_card(message,debt_id)
 
     # ---------- Smart input / Groq ----------
     @router.message(admin,F.text=="🧠 Умный ввод")
@@ -635,9 +905,12 @@ def build_router(settings: Settings, db: Database, ai: AIService, export_dir: Pa
         else:
             lines.append("Автомобили:")
             for v in await db.list_vehicles(include_archived=True):
-                s=await db.summary("personal",vehicle_id=int(v["id"]));lines.append(f"- {v['name']}: пробег {v['current_mileage']}, расходы {s.expense}")
+                s=await db.summary("personal",vehicle_id=int(v["id"]));fuel=await db.vehicle_fuel_stats(int(v["id"]));lines.append(f"- {v['name']}: пробег {v['current_mileage']}, расходы {s.expense}, топливо {fuel.get('by_type',{})}")
+            dt=await db.debt_totals();lines.append(f"Долги: мне должны {dt['to_me']}, я должен {dt['i_owe']}, чистая позиция {dt['net']}")
+            for drow in await db.list_debts(status="active"):
+                lines.append(f"- долг {drow['direction']} {drow['person']}: исходно {drow['original_amount']}, осталось {drow['remaining']}, срок {drow.get('due_date') or 'нет'}")
         lines.append("Последние операции:")
-        for r in recent_rows: lines.append(f"- {r['created_at']} {r['tx_type']} {r['amount']} {r['category']} {r.get('object_name') or ''} {r.get('vehicle_expense_type') or ''} {r.get('comment') or ''}")
+        for r in recent_rows: lines.append(f"- {r['created_at']} {r['tx_type']} {r['amount']} {r['category']} {r.get('object_name') or ''} {r.get('vehicle_expense_type') or ''} {r.get('fuel_type') or ''} {r.get('comment') or ''}")
         try:answer=await ai.answer_finance_question((message.text or "").strip(),"\n".join(lines),scope)
         except Exception as e: answer=f"Ошибка Groq: {e}"
         await state.clear()
@@ -648,7 +921,7 @@ def build_router(settings: Settings, db: Database, ai: AIService, export_dir: Pa
     async def excel(message:Message):
         rows=await db.all_transactions()
         if not rows: await message.answer("Операций пока нет.");return
-        await message.answer("Формирую Excel…");path=await create_excel(rows,await db.list_objects(True),await db.list_vehicles(True),export_dir)
+        await message.answer("Формирую Excel…");path=await create_excel(rows,await db.list_objects(True),await db.list_vehicles(True),await db.all_debts(),await db.all_debt_payments(),export_dir)
         try: await message.answer_document(FSInputFile(path),caption=f"ФД Финансы. Операций: {len(rows)}")
         finally: path.unlink(missing_ok=True)
 

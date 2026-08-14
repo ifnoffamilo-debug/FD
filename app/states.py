@@ -30,7 +30,7 @@ class VehicleFlow(StatesGroup):
 
 
 class AutoExpense(StatesGroup):
-    amount = State(); liters = State(); mileage = State(); comment = State(); confirm = State()
+    fuel_type = State(); amount = State(); liters = State(); mileage = State(); comment = State(); confirm = State()
 
 
 class MileageFlow(StatesGroup):
@@ -39,3 +39,8 @@ class MileageFlow(StatesGroup):
 
 class ServiceFlow(StatesGroup):
     title = State(); last_mileage = State(); interval = State(); note = State()
+
+
+class DebtFlow(StatesGroup):
+    direction = State(); person = State(); amount = State(); due_date = State(); comment = State(); confirm = State()
+    payment = State(); edit_person = State(); edit_amount = State(); edit_due_date = State(); edit_comment = State()

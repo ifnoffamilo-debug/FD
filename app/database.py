@@ -105,6 +105,26 @@ class Database:
                         note TEXT,
                         created_at TEXT NOT NULL
                     );
+                    CREATE TABLE IF NOT EXISTS debts (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        direction TEXT NOT NULL CHECK(direction IN ('to_me','i_owe')),
+                        person TEXT NOT NULL,
+                        original_amount REAL NOT NULL CHECK(original_amount > 0),
+                        due_date TEXT,
+                        comment TEXT,
+                        status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','closed')),
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT,
+                        closed_at TEXT
+                    );
+                    CREATE TABLE IF NOT EXISTS debt_payments (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        debt_id INTEGER NOT NULL REFERENCES debts(id) ON DELETE CASCADE,
+                        amount REAL NOT NULL CHECK(amount > 0),
+                        paid_at TEXT NOT NULL,
+                        note TEXT,
+                        transaction_id INTEGER REFERENCES transactions(id) ON DELETE SET NULL
+                    );
                     """
                 )
                 cols = {r["name"] for r in db.execute("PRAGMA table_info(transactions)")}
@@ -113,6 +133,7 @@ class Database:
                     "object_id": "INTEGER",
                     "vehicle_id": "INTEGER",
                     "vehicle_expense_type": "TEXT",
+                    "fuel_type": "TEXT",
                     "fuel_liters": "REAL",
                     "odometer": "REAL",
                     "receipt_file_id": "TEXT",
@@ -128,6 +149,8 @@ class Database:
                 db.execute("CREATE INDEX IF NOT EXISTS idx_tx_scope_date ON transactions(finance_scope, created_at)")
                 db.execute("CREATE INDEX IF NOT EXISTS idx_tx_object_id ON transactions(object_id)")
                 db.execute("CREATE INDEX IF NOT EXISTS idx_tx_vehicle_id ON transactions(vehicle_id)")
+                db.execute("CREATE INDEX IF NOT EXISTS idx_debts_status ON debts(status, direction)")
+                db.execute("CREATE INDEX IF NOT EXISTS idx_debt_payments_debt ON debt_payments(debt_id, paid_at)")
 
                 # Старые текстовые объекты превращаем в справочник объектов без потери данных.
                 names = db.execute(
@@ -166,7 +189,7 @@ class Database:
                               finance_scope: str, object_id: int | None, object_name: str | None,
                               comment: str | None, created_at: datetime, created_by: int,
                               source: str, vehicle_id: int | None = None,
-                              vehicle_expense_type: str | None = None,
+                              vehicle_expense_type: str | None = None, fuel_type: str | None = None,
                               fuel_liters: float | None = None, odometer: float | None = None) -> int:
         ts = self._ts(created_at)
         def op() -> int:
@@ -174,11 +197,11 @@ class Database:
                 cur = db.execute(
                     """
                     INSERT INTO transactions(tx_type,amount,category,finance_scope,object_id,object_name,comment,
-                        created_at,created_by,source,vehicle_id,vehicle_expense_type,fuel_liters,odometer)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        created_at,created_by,source,vehicle_id,vehicle_expense_type,fuel_type,fuel_liters,odometer)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (tx_type, amount, category, finance_scope, object_id, object_name, comment,
-                     ts, created_by, source, vehicle_id, vehicle_expense_type, fuel_liters, odometer),
+                     ts, created_by, source, vehicle_id, vehicle_expense_type, fuel_type, fuel_liters, odometer),
                 )
                 tx_id = int(cur.lastrowid)
                 db.execute("INSERT INTO audit_log(user_id,action,entity_id,details,created_at) VALUES(?,?,?,?,?)",
@@ -391,12 +414,126 @@ class Database:
                 return max(0.0,float(r["mx"])-float(r["mn"]))
         return await self._run(op)
 
-    async def vehicle_fuel_stats(self, vehicle_id: int, start: datetime | None=None, end: datetime | None=None) -> dict[str,float]:
+    async def vehicle_fuel_stats(self, vehicle_id: int, start: datetime | None=None, end: datetime | None=None) -> dict[str,Any]:
         where,params=self._scope_where("personal",start,end); where += " AND vehicle_id=? AND vehicle_expense_type='Топливо'";params.append(vehicle_id)
         def op():
             with self._connect() as db:
-                r=db.execute(f"SELECT COALESCE(SUM(amount),0) amount,COALESCE(SUM(fuel_liters),0) liters FROM transactions WHERE {where}",params).fetchone()
-                amount=float(r["amount"]);liters=float(r["liters"]);return {"amount":amount,"liters":liters,"avg_price":amount/liters if liters else 0.0}
+                rows=db.execute(f"""SELECT COALESCE(NULLIF(fuel_type,''),'Не указано') fuel_type,
+                    COALESCE(SUM(amount),0) amount,COALESCE(SUM(fuel_liters),0) liters,COUNT(*) count
+                    FROM transactions WHERE {where} GROUP BY COALESCE(NULLIF(fuel_type,''),'Не указано')""",params).fetchall()
+                result={"amount":0.0,"liters":0.0,"avg_price":0.0,"by_type":{}}
+                for r in rows:
+                    amount=float(r["amount"]);liters=float(r["liters"]);name=str(r["fuel_type"])
+                    result["by_type"][name]={"amount":amount,"liters":liters,"avg_price":amount/liters if liters else 0.0,"count":int(r["count"])}
+                    result["amount"]+=amount;result["liters"]+=liters
+                result["avg_price"]=result["amount"]/result["liters"] if result["liters"] else 0.0
+                return result
+        return await self._run(op)
+
+    # ---------------- Debts ----------------
+    async def add_debt(self, direction: str, person: str, amount: float, due_date: str | None,
+                       comment: str | None, when: datetime) -> int:
+        ts=self._ts(when)
+        def op() -> int:
+            with self._connect() as db:
+                cur=db.execute("""INSERT INTO debts(direction,person,original_amount,due_date,comment,created_at)
+                    VALUES(?,?,?,?,?,?)""",(direction,person,amount,due_date,comment,ts))
+                return int(cur.lastrowid)
+        return await self._run(op)
+
+    async def get_debt(self, debt_id: int) -> dict[str,Any] | None:
+        def op():
+            with self._connect() as db:
+                r=db.execute("""SELECT d.*,COALESCE(SUM(p.amount),0) paid_amount
+                    FROM debts d LEFT JOIN debt_payments p ON p.debt_id=d.id
+                    WHERE d.id=? GROUP BY d.id""",(debt_id,)).fetchone()
+                if not r:return None
+                d=dict(r);d["remaining"]=max(0.0,float(d["original_amount"])-float(d["paid_amount"]));return d
+        return await self._run(op)
+
+    async def list_debts(self, status: str | None="active", direction: str | None=None) -> list[dict[str,Any]]:
+        def op():
+            with self._connect() as db:
+                clauses=[];params=[]
+                if status:clauses.append("d.status=?");params.append(status)
+                if direction:clauses.append("d.direction=?");params.append(direction)
+                where=("WHERE "+" AND ".join(clauses)) if clauses else ""
+                rows=db.execute(f"""SELECT d.*,COALESCE(SUM(p.amount),0) paid_amount
+                    FROM debts d LEFT JOIN debt_payments p ON p.debt_id=d.id {where}
+                    GROUP BY d.id ORDER BY CASE WHEN d.due_date IS NULL THEN 1 ELSE 0 END,d.due_date,d.created_at DESC""",params).fetchall()
+                out=[]
+                for r in rows:
+                    d=dict(r);d["remaining"]=max(0.0,float(d["original_amount"])-float(d["paid_amount"]));out.append(d)
+                return out
+        return await self._run(op)
+
+    async def debt_totals(self) -> dict[str,float]:
+        rows=await self.list_debts(status="active")
+        to_me=sum(float(r["remaining"]) for r in rows if r["direction"]=="to_me")
+        i_owe=sum(float(r["remaining"]) for r in rows if r["direction"]=="i_owe")
+        return {"to_me":to_me,"i_owe":i_owe,"net":to_me-i_owe,"count":float(len(rows))}
+
+    async def add_debt_payment(self, debt_id: int, amount: float, when: datetime, note: str | None=None) -> int:
+        ts=self._ts(when)
+        def op() -> int:
+            with self._connect() as db:
+                debt=db.execute("SELECT * FROM debts WHERE id=?",(debt_id,)).fetchone()
+                if not debt:raise ValueError("Долг не найден")
+                paid=float(db.execute("SELECT COALESCE(SUM(amount),0) s FROM debt_payments WHERE debt_id=?",(debt_id,)).fetchone()["s"])
+                remaining=max(0.0,float(debt["original_amount"])-paid)
+                if amount<=0:raise ValueError("Сумма должна быть больше нуля")
+                if amount>remaining+0.005:raise ValueError("Сумма погашения больше остатка долга")
+                cur=db.execute("INSERT INTO debt_payments(debt_id,amount,paid_at,note) VALUES(?,?,?,?)",(debt_id,amount,ts,note))
+                if remaining-amount<=0.005:
+                    db.execute("UPDATE debts SET status='closed',closed_at=?,updated_at=? WHERE id=?",(ts,ts,debt_id))
+                else:
+                    db.execute("UPDATE debts SET updated_at=? WHERE id=?",(ts,debt_id))
+                return int(cur.lastrowid)
+        return await self._run(op)
+
+    async def get_debt_payment(self, payment_id: int) -> dict[str,Any] | None:
+        def op():
+            with self._connect() as db:
+                r=db.execute("""SELECT p.*,d.direction,d.person,d.original_amount,d.status
+                    FROM debt_payments p JOIN debts d ON d.id=p.debt_id WHERE p.id=?""",(payment_id,)).fetchone()
+                return dict(r) if r else None
+        return await self._run(op)
+
+    async def set_debt_payment_transaction(self, payment_id: int, transaction_id: int) -> None:
+        def op():
+            with self._connect() as db:db.execute("UPDATE debt_payments SET transaction_id=? WHERE id=?",(transaction_id,payment_id))
+        await self._run(op)
+
+    async def debt_payments(self, debt_id: int) -> list[dict[str,Any]]:
+        def op():
+            with self._connect() as db:
+                return [dict(r) for r in db.execute("SELECT * FROM debt_payments WHERE debt_id=? ORDER BY paid_at DESC,id DESC",(debt_id,)).fetchall()]
+        return await self._run(op)
+
+    async def update_debt(self, debt_id: int, *, person: str | None=None, original_amount: float | None=None,
+                          due_date: str | None | object=..., comment: str | None | object=...) -> None:
+        fields=[];params=[]
+        if person is not None:fields.append("person=?");params.append(person)
+        if original_amount is not None:
+            payments=await self.debt_payments(debt_id);paid=sum(float(x["amount"]) for x in payments)
+            if original_amount+0.005<paid:raise ValueError("Новая сумма меньше уже погашенной")
+            fields.append("original_amount=?");params.append(original_amount)
+        if due_date is not ...:fields.append("due_date=?");params.append(due_date)
+        if comment is not ...:fields.append("comment=?");params.append(comment)
+        if not fields:return
+        fields.append("updated_at=?");params.append(datetime.now().strftime("%Y-%m-%d %H:%M:%S"));params.append(debt_id)
+        def op():
+            with self._connect() as db:db.execute(f"UPDATE debts SET {','.join(fields)} WHERE id=?",params)
+        await self._run(op)
+
+    async def all_debts(self) -> list[dict[str,Any]]:
+        return await self.list_debts(status=None)
+
+    async def all_debt_payments(self) -> list[dict[str,Any]]:
+        def op():
+            with self._connect() as db:
+                return [dict(r) for r in db.execute("""SELECT p.*,d.person,d.direction FROM debt_payments p
+                    JOIN debts d ON d.id=p.debt_id ORDER BY p.paid_at DESC,p.id DESC""").fetchall()]
         return await self._run(op)
 
     async def add_service(self, vehicle_id: int, title: str, last: float, interval: float, note: str | None, when: datetime) -> int:
